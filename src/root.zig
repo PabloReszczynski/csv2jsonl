@@ -1,3 +1,9 @@
+// Copyright © Pablo Reszczynski
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 //! CSV to JSON Lines converter.
 //!
 //! Reads CSV from a `std.Io.Reader` and writes one JSON object per line to a
