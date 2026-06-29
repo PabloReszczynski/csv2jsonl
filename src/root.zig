@@ -21,13 +21,101 @@ pub const Options = struct {
     /// Byte that escapes the following character inside a field.
     escape: u8 = '\\',
     /// Provide optional header
-    header: ?[][]const u8 = null
+    header: ?[][]const u8 = null,
 };
 
 pub const Error = error{
     /// A data row has a different number of fields than the header row.
     UnmatchedHeaderAndRowColumns,
 };
+
+/// Finds the first position of any of the values provided in the buffer.
+///
+/// Similar to `indexOfAny` but uses SIMD to find values in parallel.
+fn vIndexOfAny(buffer: []const u8, values: []const u8) ?usize {
+    const vec_len = 16;
+    const Vec = @Vector(vec_len, u8);
+    var i: usize = 0;
+    while (i + vec_len <= buffer.len) : (i += vec_len) {
+        const chunk: Vec = buffer[i..][0..vec_len].*;
+        var bitmask: u16 = 0;
+        for (values) |val| {
+            const is_equal = chunk == @as(Vec, @splat(val));
+            bitmask |= @as(u16, @bitCast(is_equal));
+        }
+        if (bitmask != 0) return i + @ctz(bitmask);
+    }
+    while (i < buffer.len) : (i += 1) {
+        for (values) |val| if (buffer[i] == val) return i;
+    }
+    return null;
+}
+
+fn outputSpecialEscape(c: u8, writer: *std.Io.Writer) !void {
+    switch (c) {
+        '\\' => try writer.writeAll("\\\\"),
+        '\"' => try writer.writeAll("\\\""),
+        0x08 => try writer.writeAll("\\b"),
+        0x0C => try writer.writeAll("\\f"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        else => {
+            try writer.writeAll("\\u00");
+            const hex = "0123456789abcdef";
+            try writer.writeByte(hex[(c >> 4) & 0xF]);
+            try writer.writeByte(hex[c & 0xF]);
+        },
+    }
+}
+
+fn needsEscape(c: u8) bool {
+    return c < 0x20 or c == '"' or c == '\\';
+}
+
+/// SIMD-Powered JSON string serializer
+///
+/// Write `s` as a JSON string literal with surrounding quotes (`"`).
+/// Handles escaping and control characters.
+fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+    try writer.writeByte('"');
+
+    // apple m3 chip NEON register are 16 bytes, so we can use 16-length vector
+    // and use 1 register per operation
+    // TODO: Tune this value or allow users to set it, or check user arch.
+    const vec_len = 16;
+    const Vec = @Vector(vec_len, u8);
+    var i: usize = 0;
+    var start: usize = 0;
+    // use simd to find positions where special characters lie, then use a bitmask
+    // to replace them with their escaped versions
+    while (i + vec_len <= s.len) {
+        const chunk = s[i..][0..vec_len].*;
+        const is_control_char = chunk < @as(Vec, @splat(0x20));
+        const is_quote = chunk == @as(Vec, @splat('"'));
+        const is_backslash = chunk == @as(Vec, @splat('\\'));
+        const bitmask: u16 = @as(u16, @bitCast(is_control_char)) | @as(u16, @bitCast(is_quote)) | @as(u16, @bitCast(is_backslash));
+        if (bitmask != 0) {
+            const offset = @ctz(bitmask);
+            try writer.writeAll(s[start .. i + offset]);
+            try outputSpecialEscape(s[i + offset], writer);
+            i += offset + 1;
+            start = i;
+        } else {
+            i += vec_len;
+        }
+    }
+    // Use manual (byte by byte) serialization for the rest of the characters
+    while (i < s.len) : (i += 1) {
+        if (needsEscape(s[i])) {
+            try writer.writeAll(s[start..i]);
+            try outputSpecialEscape(s[i], writer);
+            start = i + 1;
+        }
+    }
+    try writer.writeAll(s[start..]);
+    try writer.writeByte('"');
+}
 
 /// Read CSV from `reader` and write one JSON object per line to `writer`.
 ///
@@ -119,7 +207,7 @@ pub fn stream_csv_to_jsonl(allocator: std.mem.Allocator, options: Options, reade
                 const active_special = if (in_quote) &[_]u8{ options.quote, options.escape } else &special;
 
                 // find next special character using simd
-                if (std.mem.indexOfAny(u8, buffer, active_special)) |pos| {
+                if (vIndexOfAny(buffer, active_special)) |pos| {
                     const byte = buffer[pos];
                     // append all the characters before the special char
                     try sb.appendSlice(allocator, buffer[0..pos]);
@@ -196,15 +284,16 @@ pub fn stream_csv_to_jsonl(allocator: std.mem.Allocator, options: Options, reade
         }
 
         // serialize to json
-        var ws: std.json.Stringify = .{
-            .writer = writer,
-        };
-        try ws.beginObject();
-        for (header.?, cells.items) |k, v| {
-            try ws.objectField(k);
-            try ws.write(v);
+        // we use our own handrolled JSON serializer that uses SIMD to optimize
+        // writing strings by replacing special characters in parallel
+        // (since we only produce objects of type string -> string)
+        try writer.writeByte('{');
+        for (header.?, cells.items, 0..) |k, v, idx| {
+            if (idx != 0) try writer.writeByte(',');
+            try writeJsonString(writer, k);
+            try writer.writeByte(':');
+            try writeJsonString(writer, v);
         }
-        try ws.endObject();
-        try writer.writeByte('\n');
+        try writer.writeAll("}\n");
     }
 }
