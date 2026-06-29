@@ -9,8 +9,7 @@ cat myfile.csv | csv2jsonl > result.jsonl
 ```
 
 ### Library
-This package is also provided as a Zig 0.16.0-compatible library with the function
-`stream_csv_to_jsonl(allocator: std.mem.Allocator, options: Options, reader: *std.Io.Reader, writer: *std.Io.Writer) !void;
+This package is also provided as a Zig 0.16.0-compatible library with the function `stream_csv_to_jsonl(allocator: std.mem.Allocator, options: Options, reader: *std.Io.Reader, writer: *std.Io.Writer) !void;`
 
 The API is in alpha and subject to change.
 It doesn't use any external libraries and I plan to keep it that way.
